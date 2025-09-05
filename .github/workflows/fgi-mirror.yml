@@ -1,0 +1,41 @@
+name: Mirror FGI to Gist
+on:
+  schedule:
+    - cron: "0 * * * *"   # 毎時0分（UTC）。JSTだと毎時「+9時間」
+  workflow_dispatch:       # 手動実行ボタン
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch CNN FGI JSON (with retry)
+        run: |
+          set -e
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+          for i in 1 2 3; do
+            curl -f -sS \
+              -H "User-Agent: $UA" \
+              -H "Accept: application/json" \
+              -H "Referer: https://edition.cnn.com/" \
+              "https://production.dataviz.cnn.io/index/fearandgreed/graphdata" \
+              -o fgi_full.json && break || sleep $((3*i))
+          done
+          # 必要最小の3項目に整形（片方の形でも拾えるように両対応）
+          jq '{score: (.fear_and_greed.score // .score),
+               rating: (.fear_and_greed.rating // .rating),
+               timestamp: (.fear_and_greed.timestamp // .timestamp)}' \
+             fgi_full.json > fgi.json
+          # 3項目が揃わなければ失敗扱いにして上書き防止
+          jq -e 'has("score") and has("rating") and has("timestamp")' fgi.json > /dev/null
+
+      - name: Update Gist raw JSON
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID:  ${{ secrets.FGI_GIST_ID }}
+        run: |
+          set -e
+          echo '{"files":{"fgi.json":{"content":'$(jq -c . fgi.json)'}}}' > payload.json
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/gists/${GIST_ID}" \
+            -d @payload.json
