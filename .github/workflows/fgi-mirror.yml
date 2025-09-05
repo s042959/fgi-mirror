@@ -1,68 +1,28 @@
-name: Mirror FGI to Gist
-on:
-  schedule:
-    - cron: "0 * * * *"            # 毎時（UTC）。手動でも実行可
-  workflow_dispatch:
-jobs:
-  mirror:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch CNN FGI JSON (with retry)
-        id: fetch
-        run: |
-          set -e
-          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-          for i in 1 2 3; do
-            curl -f -sS \
-              -H "User-Agent: $UA" \
-              -H "Accept: application/json" \
-              -H "Referer: https://edition.cnn.com/" \
-              "https://production.dataviz.cnn.io/index/fearandgreed/graphdata" \
-              -o fgi_full.json && break || sleep $((3*i))
-          done
-          echo "== RAW FROM CNN (head) =="
-          head -c 200 fgi_full.json || true
-
-          # 3項目だけ抽出（両系統に対応）
-          jq '{score: (.fear_and_greed.score // .score),
-               rating: (.fear_and_greed.rating // .rating),
-               timestamp: (.fear_and_greed.timestamp // .timestamp)}' \
-             fgi_full.json > fgi.json
-
-          # 妥当性チェック（欠損なら失敗＝上書き防止）
-          jq -e 'has("score") and has("rating") and has("timestamp")' fgi.json > /dev/null
-
-          echo "== COMPACT JSON =="
-          cat fgi.json
-
       - name: Update Gist raw JSON
-        id: update
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID:  ${{ secrets.FGI_GIST_ID }}
         run: |
           set -e
-          echo '{"files":{"fgi.json":{"content":'$(jq -c . fgi.json)'}}}' > payload.json
+          # 1) fgi.json の中身を 1行JSONに
+          COMPACT=$(jq -c . fgi.json)
+          # 2) それを「JSON文字列」にエスケープ（Gist APIは string 必須）
+          CONTENT=$(printf '%s' "$COMPACT" | jq -Rs .)
+          # 3) PATCH ペイロード生成
+          cat > payload.json <<EOF
+          { "files": { "fgi.json": { "content": $CONTENT } } }
+          EOF
+
           echo "== PATCH to Gist ${GIST_ID} =="
           curl -sS -X PATCH \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/gists/${GIST_ID}" \
             -d @payload.json | tee patch_out.json
-          # 失敗の兆候を検出（例：message フィールド）
+
+          # 失敗の兆候を検出
           if jq -e 'has("message") and .message != null' patch_out.json >/dev/null; then
             echo "Gist API error:"
             cat patch_out.json
             exit 1
           fi
-
-      - name: Verify Gist content (GET raw back)
-        env:
-          GIST_ID: ${{ secrets.FGI_GIST_ID }}
-        run: |
-          set -e
-          RAW_URL="https://gist.githubusercontent.com/s042959/${GIST_ID}/raw/fgi.json?t=$(date +%s)"
-          echo "== GET ${RAW_URL} =="
-          curl -sS "$RAW_URL" | tee fetched.json
-          echo "== DIFF (local fgi.json vs fetched) =="
-          diff -u <(jq -S . fgi.json) <(jq -S . fetched.json) || true
